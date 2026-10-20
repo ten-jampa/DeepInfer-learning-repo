@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Reference 0001 — DeepInfer repo map</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="lesson-header">
+  <p class="kicker">Reference · 0001</p>
+  <h1>DeepInfer repo map</h1>
+  <p class="meta"><b>What this is</b>: the compressed, printable map of <code>../DeepInfer</code>. One line per directory,
+  then the boot path, then the README feature → code mapping. Keep this open whenever a lesson points at code.</p>
+</header>
+
+<h2>Top level</h2>
+<table>
+  <tr><th>Directory / file</th><th>What it is (one line)</th></tr>
+  <tr><td><code>deepinfer/entrypoints/</code></td><td>Public API: <code>llm.py</code> defines <code>LLM</code>, the offline-inference user-facing class.</td></tr>
+  <tr><td><code>deepinfer/engine/</code></td><td>Engine core: <code>llm_engine.py</code> (creates workers, cache, the scheduler), arg utils, profiling, stats logging.</td></tr>
+  <tr><td><code>deepinfer/worker/</code></td><td>Per-GPU workers: <code>model_runner.py</code>, KV-cache engine, CUDA-graph runners (incl. <code>dflash_</code> for the draft model), runtime config, <code>zos_status.py</code>.</td></tr>
+  <tr><td><code>deepinfer/model_executor/</code></td><td>The model itself: <code>models/deepseek.py</code> + <code>v4_modules/</code>, <code>mtp/</code>, vision encoder, layers (attention backend, sampler, TileLang ops, EPLB, input metadata, parallel utils).</td></tr>
+  <tr><td><code>deepinfer/_C/</code></td><td>Python-visible stubs ( <code>.pyi</code> ) for the <b>native C++ core</b> — including the batch <code>Scheduler</code>. The engine's scheduling hot loop is not Python.</td></tr>
+  <tr><td><code>csrc/</code></td><td>C++ sources binding <code>_C</code> (engine, CUDA utils, graph timer, utils, pybind) and Ascend utilities.</td></tr>
+  <tr><td><code>deepinfer/ve/</code></td><td>Vision-encoder (multimodal) processing: processors, schemas, tensor preparation for VL requests.</td></tr>
+  <tr><td><code>deepinfer/structure_output/</code></td><td>Structured outputs: grammar compiler, token-mask matcher, matchers for regex/JSON/EBNF.</td></tr>
+  <tr><td><code>deepinfer/distributed/</code></td><td>Inter-node plumbing: <code>shm_broadcast.py</code> shared-memory broadcast.</td></tr>
+  <tr><td><code>deep_cluster/</code></td><td>Cluster legibility: <code>hardware/</code> (nvidia/ascend/cpu device info), <code>topology/bind.py</code> (binding processes to devices/NICs).</td></tr>
+  <tr><td><code>deepinfer/hugging_face/</code></td><td>Weights/config/tokenizer loading from HF checkpoints.</td></tr>
+  <tr><td><code>vendor/</code></td><td>Git submodules of DeepSeek's own kernel libraries: FlashMLA, DeepGEMM (×Ascend), DeepEP (×Ascend), DeepSelect. Not DeepInfer's own code.</td></tr>
+  <tr><td><code>deepinfer/npu_ops/</code></td><td>Ascend-native ops (deep_select, vit_attn) — the non-trivial half of the dual-hardware story.</td></tr>
+  <tr><td><code>examples/</code></td><td>Offline inference, <code>benchmark.py</code> + <code>sweep/</code> (the performance methodology), structured output, profiling, YOCO examples.</td></tr>
+  <tr><td><code>eval/</code></td><td>Quality evals: AIME, GPQA, HLE with common runner/scorer.</td></tr>
+  <tr><td><code>tests/</code></td><td>Model & engine tests; offline-decode PPL baselines (<code>offline_decode_ppl.json</code>) served as golden regression numbers.</td></tr>
+  <tr><td><code>doc/</code></td><td><code>inference_deployment_qa.md</code> — the densest design document; images for architecture.</td></tr>
+</table>
+
+<h2>The boot path (memorize this spine)</h2>
+<pre>examples/offline_inference.py
+  → deepinfer/entrypoints/llm.py            class LLM            (user-facing; tokenizes prompts)
+    → deepinfer/engine/llm_engine.py        class LLMEngine      (spawns workers, inits cache)
+        ├─ _create_scheduler()  → deepinfer._C.engine.Scheduler   (native code: csrc/engine/)
+        └─ _init_workers()      → deepinfer/worker/worker.py
+              → worker/model_runner.py      class ModelRunner    (forward pass on GPU)
+                  → deepinfer/model_executor/models/deepseek.py  DeepseekForCausalLM
+                      → layers/  attention_backend · moe/linear · sampler · tilelang_ops
+                      → vendor/  FlashMLA · DeepGEMM · DeepEP · DeepSelect kernels
+</pre>
+<p class="footnote">Grep to re-derive any line: <code>grep -n "class LLMEngine" deepinfer/engine/llm_engine.py</code> tends to hold still across updates.</p>
+
+<h2>README feature → where it lives</h2>
+<table>
+  <tr><th>Feature (README bullet)</th><th>Code / doc anchor</th></tr>
+  <tr><td>Optimized kernels</td><td><code>vendor/</code> submodules + <code>model_executor/layers/tilelang_ops/</code> + <code>csrc/</code></td></tr>
+  <tr><td>Attention DP / balanced CP, MoE EP + EPLB</td><td><code>model_executor/eplb/</code>, parallel utils in <code>model_executor/</code>, <code>--ep/--dp/--cp</code> in <code>examples/</code></td></tr>
+  <tr><td>DSpark & confidence-scheduled verification (spec. decode)</td><td><code>model_executor/models/mtp/</code>, <code>layers/mtp_info_pool.py</code>, <code>worker/dflash_cuda_graph_runner.py</code>, env <code>DEEPINFER_ENABLE_MTP_VARLEN</code>, <code>DEEPINFER_USE_NEXTN_DECODE</code></td></tr>
+  <tr><td>SWA bounded replay</td><td>YOCO examples <code>examples/yoco/</code>, env <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code>, <code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code></td></tr>
+  <tr><td>Asynchronous scheduling (zero-overhead)</td><td>native <code>Scheduler</code> in <code>deepinfer/_C</code>, <code>worker/zos_status.py</code>, TileLang ops <code>*_zos.py</code></td></tr>
+  <tr><td>Batch-invariant inference / deterministic sampling</td><td>env <code>DEEPINFER_BATCH_INVARIANT</code>; sampler in <code>model_executor/layers/sampler.py</code></td></tr>
+  <tr><td>Structured outputs</td><td><code>deepinfer/structure_output/</code>, <code>SOMatcherBuilder</code> hook on <code>LLMEngine</code>, <code>examples/_structured_output.py</code></td></tr>
+  <tr><td>Multimodal (VL)</td><td><code>deepinfer/ve/</code>, <code>model_executor/models/vision_encoder/</code>, <code>models/deepseek_vl.py</code></td></tr>
+  <tr><td>Hardware portability</td><td><code>DEEPINFER_ACCELERATOR=nvidia|ascend</code>, <code>deep_cluster/hardware/*</code>, <code>vendor/*-Ascend</code>, <code>deepinfer/npu_ops/</code>, requirements files</td></tr>
+</table>
+
+<h2>The three mission-critical numbers (from <code>doc/inference_deployment_qa.md</code>)</h2>
+<ul>
+  <li><b>155 trillion tokens/day</b> served by one cluster.</li>
+  <li><b>US$38 per GPU-hour</b> revenue at valley pricing — the disclosure that made people do math.</li>
+  <li><b>72+ hours</b> of KV-cache retention (chatbot TTL ≈ 7 d, agent ≈ 3 d) on ~100 PiB of 3FS storage.</li>
+</ul>
+
+<h2>What is deliberately NOT in this release (README:38-42)</h2>
+<ul>
+  <li>An HTTP/API serving entrypoint. The only HTTP server is an internal profiling
+      dashboard (<code>engine/profile_server.py</code>).</li>
+  <li>The <b>production KV cache system</b>: in-flight KV machinery lives in <code>worker/cache_engine.py</code>,
+      but the persistent 3FS-backed store is external.</li>
+  <li>VE/Prefill/Decode <b>disaggregation glue</b> ("most required engine functionality is already implemented")
+      and cross-replica DP load balancing.</li>
+  <li>DSML token-protocol handling — lives in the separate
+      <a href="https://github.com/deepseek-ai/deepseek-recipe">deepseek-recipe</a> repo.</li>
+</ul>
+
+<h2>Key top-level files worth knowing</h2>
+<ul>
+  <li><code>environ.py</code> — every feature env var in one place (grep <code>DEEPINFER_</code>) — start here when a lesson names a knob.</li>
+  <li><code>sequence.py</code> — per-sequence + GPU-resident zos bookkeeping (sampled tokens, MTP predicts, confidence rates).</li>
+  <li><code>sampling_params.py</code>, <code>shared_memory.py</code>, <code>model_config_loader.py</code>, <code>config.py</code> (incl. <code>SchedulerConfig</code>).</li>
+</ul>
+</body>
+</html>

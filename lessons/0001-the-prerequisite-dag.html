@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lesson 0001 — The Prerequisite DAG</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="lesson-header">
+  <p class="kicker">Lesson · 0001</p>
+  <h1>The prerequisite DAG</h1>
+  <p class="meta"><b>Mission tie</b>: understand the frontier + career edge. ·
+    <b>Time</b>: ~25 min read + 15 min repo walk + assignment. ·
+    <b>Win</b>: you can (a) explain why HN called this "a nuclear bomb" with numbers, and (b) name the one file
+    that owns each concept in <code>../DeepInfer</code>.</p>
+</header>
+
+<p>In June 2025 the US restricted GPU exports; in October 2026 DeepSeek published the code its own production
+serving runs on. This lesson is the map. Every later lesson is one card in it, read top-down in dependency order.
+The goal: after this lesson you know <em>what the pieces are</em>; subsequent lessons do each card's depth work.</p>
+
+<h2>1 · Why "nuclear bomb" <span class="meta">— the significance layer</span></h2>
+
+<p>Strip the hype from the <a href="https://news.ycombinator.com/item?id=50163277" title="2,007 pts, ~750 comments on release day">HN front-page thread</a>
+and four real claims remain. Each one is checkable against the repo's own <code>doc/inference_deployment_qa.md</code>.</p>
+
+<details class="node" open><summary><span class="nid">S1</span><span class="star">They published their margins</span></summary>
+  <div class="body"><p>One cluster serves <b>155 trillion tokens/day</b>; overall revenue is
+  <b>US$38 per GPU-hour</b> "at valley pricing" <span class="cite">(<a href="../reference/0001-repo-map.html#section">Q&A §overview</a>)</span>.
+  Frontier labs publish price lists, not actual earnings per GPU-hour. When a price leader discloses unit revenue,
+  every inference vendor's spreadsheet becomes guesswork-if-generous.</p>
+  <p>HN did the math immediately: at ~26k tok/s/GPU the benchmark implies roughly tens of thousands of GPUs just to match
+  the token claim — <a href="https://news.ycombinator.com/item?id=50172066">one comment thread redoing it</a>.
+  Either number, taken alone, reframes what a token should cost.</p></div></details>
+
+<details class="node"><summary><span class="nid">S2</span> The best operator dumped its production stack</summary>
+  <div class="body"><p>DeepInfer is <b>the serving code behind a model that hundreds of millions use</b>, self-reported as
+  built on <a href="https://github.com/vllm-project/vllm">vLLM</a> with ideas from
+  <a href="https://github.com/sgl-project/sglang">SGLang</a> and TensorRT-LLM <span class="cite">(README §acknowledgments)</span>.
+  The companies selling "we serve models better than you can" (Together, Fireworks, Baseten, DeepInfra…) now compete
+  against their own best supplier's free code — with the originators saying inference code for <em>future</em> DeepSeek
+  models continues landing here <span class="cite">(Q&A §1)</span>.</p></div></details>
+
+<details class="node"><summary><span class="nid">S3</span> Frontier serving, dual-hardware, sanctioned-proof</summary>
+  <div class="body"><p>Builds run on both <b>NVIDIA SM100</b> and <b>Huawei Ascend 950</b> — with full kernel-port twins
+  (<code>vendor/DeepGEMM-Ascend</code>, <code>vendor/DeepEP-Ascend</code>, <code>deepinfer/npu_ops/</code>).
+  That is public evidence that frontier-grade inference has been ported off NVIDIA silicon, down to the kernels.
+  Combined with DeepSeek's low energy costs <span class="cite">(HN threads on China infrastructure)</span>, the release
+  reads as an economic statement about where serving can live.</p></div></details>
+
+<details class="node"><summary><span class="nid">S4</span> FP4 at production scale</summary>
+  <div class="body"><p>The Q&A states the formats plainly: main KV cache <b>per-16 e4m3</b> (NVFP4-style minus global
+  scale), indexer KV and MoE routed-expert weights <b>per-32 ue8m0 MXFP4</b>, SWA KV in MXFP8 (528 B/token).
+  4-bit KV at trillion-token/day scale is an economics claim as much as a numerics one — decode is
+  memory-bandwidth-bound (node A1), so halving bits ~doubles the wall you hit first.</p></div></details>
+
+<details class="node"><summary><span class="nid">S5</span> The skeptic's card (always carry one)</summary>
+  <div class="body"><p>The "bomb" framing deserves counterweight: benchmarks are self-reported on their own hardware  <span class="cite">(<code>examples/benchmark.py</code>, <code>examples/sweep/run_sweep.sh</code>)</span>;
+  the Q&A admits public FlashMLA lacks one hand-tuned SASS optimization making decode kernels 5–10% slower than
+  internal, with end-to-end within ~5% <span class="cite">(Q&A §kernels)</span>. The per-GPU revenue number is "overall revenue
+  at valley pricing" — not a margin statement. Lesson 0006 covers reading these benchmarks honestly.</p></div></details>
+
+<details class="node mission"><summary><span class="nid">S6</span> The open-drops lineage (context you'll be expected to know)</summary>
+  <div class="body"><p>DeepSeek has burned down its library in public once before — FlashMLA, DeepGEMM, DeepEP, 3FS,
+  TileLang, and now deepseek-recipe alongside DeepInfer. Each repo is used by a later lesson: kernels (D3),
+  the KV store (B5), protocol handling (a later peripheral lesson).</p></div></details>
+
+<h2>2 · Tier A — Serving fundamentals <span class="meta">— vocabulary of the whole course</span></h2>
+<p class="prereq">built on: nothing but an API-user's intuition</p>
+<details class="node" open><summary><span class="nid">A1</span><span class="star">Prefill vs decode: two beasts</span></summary>
+  <div class="body"><p>Generating one response = <b>prefill</b> (read the whole prompt in parallel; compute-bound,
+  GPU math is starved for work) + <b>decode</b> (produce one token at a time; each step re-reads weights and KV
+  from memory; memory-bandwidth-bound). Nearly every design decision in DeepInfer follows from the fact
+  that these two <em>need different resources</em> — and the repo generalizes that to a third: the vision encoder
+  (VE), producing a VE/Prefill/Decode (EPD) disaggregated architecture <span class="cite">(Q&A §overview)</span>.</p></div></details>
+
+<details class="node"><summary><span class="nid">A2</span><span class="star">KV cache & paged KV</span></summary>
+  <div class="body"><p>Saving attention's keys/values per layer avoids recomputing the prompt for every token — it is the
+  thing that makes decode cheap and also the thing that eats all memory.
+  <b>Paged KV</b> (vLLM's idea, DeepInfer builds on vLLM) stores it in fixed-size blocks instead of one contiguous
+  slab, removing fragmentation. Both prefill <em>and</em> decode use paged blocks in DeepInfer <span class="cite">(Q&A §block KV)</span>.
+  Primary source: <a href="https://arxiv.org/abs/2309.06180">PagedAttention paper</a>.</p></div></details>
+
+<details class="node"><summary><span class="nid">A3</span> SLOs & batching: the Pareto frontier</summary>
+  <div class="body"><p><b>TTFT</b> (time to first token), <b>TBT/ITL</b> (time between tokens), and
+  <b>throughput</b> trade off against each other; batching raises throughput and hurts TBT. The README's two
+  Pareto plots are that story. Lesson 0006 will make you able to reproduce them with <code>examples/benchmark.py</code>'s
+  methodology (its metrics are subtly defined — the README's benchmark section is longer than some papers).</p></div></details>
+
+<details class="node"><summary><span class="nid">A4</span><span class="star">The parallelism suite & Wide-EP</span></summary>
+  <div class="body"><p>Splitting one model across GPUs: <b>DP</b> (replicate, split requests), <b>TP</b> (split each
+  matrix), <b>PP</b> (split by layers), <b>EP</b> (split MoE experts), <b>CP</b> (split sequence context — DeepInfer's
+  "balanced CP"). Rule from the Q&A: prefill uses the <b>smallest</b> EP/DP that HBM allows (2–8); decode uses the
+  <b>largest</b> (64–128, "Wide-EP") to cut per-step memory traffic in the MoE part; TP/CP unused for prefill/decode core.
+  Prefill and decode sitting at opposite ends of that dial is one of the two big reasons they're disaggregated (A1).</p></div></details>
+
+<details class="node"><summary><span class="nid">A5</span> MoE anatomy & EPLB</summary>
+  <div class="body"><p>MoE layers route each token to a few <b>routed experts</b> (+ always-on <b>shared expert</b>).
+  Hot experts overload GPUs; <b>EPLB</b> fixes load imbalance with redundant copies of hot experts, re-assigned
+  every N steps from observed load — measured imbalance 1.045–1.09 (slowest/mean) <span class="cite">(Q&A §EPLB)</span>.
+  DeepSeek is the industry's scale leader here; EP + EPLB is where their throughput advantage concentrates.</p></div></details>
+
+<details class="node"><summary><span class="nid">A6</span> Speculative decoding & MTP</summary>
+  <div class="body"><p>Decode one-token-at-a-time wastes the GPU. A tiny <b>draft model</b> (in DeepSeek's case the
+  model's own <b>MTP</b> head — multi-token prediction) guesses several future tokens; the big model <b>verifies</b>
+  them in one forward pass — same quality, more tokens per step. Default: 5 drafts/request
+  (<code>DEEPINFER_USE_NEXTN_DECODE</code>); production acceptance ≈ 3.2–3.3 tokens <span class="cite">(Q&A §spec decoding)</span>.</p></div></details>
+
+<details class="node"><summary><span class="nid">A7</span> Quantization formats you must read</summary>
+  <div class="body"><p>You need vocabulary, not numerics theory: <b>BF16/FP8</b> baseline; <b>e4m3</b> = an FP8 layout;
+  <b>ue8m0</b> = power-of-2 scale exponent; <b>MXFP4</b> = per-32-element-block 4-bit with shared scale;
+  <b>NVFP4</b> = NVIDIA's per-16 variant (DeepInfer: "like NVFP4 but without the global scale").
+  Where each lives: main KV per-16 e4m3; indexer KV & MoE weights per-32 MXFP4; SWA KV MXFP8. <span class="cite">(Q&A §low-precision)</span></p></div></details>
+
+<h2>3 · Tier B — The machine substrate <span class="meta">— why the software is shaped this way</span></h2>
+<p class="prereq">built on: A1 (the two-phase insight), A4 (parallelism)</p>
+
+<details class="node"><summary><span class="nid">B1</span> GPU anatomy & the roofline</summary>
+  <div class="body"><p>SMs do math; <b>HBM</b> supplies data. Tensor-heavy prefill can saturate SMs; decode usually
+  can't — it limps at the HBM bytes/step wall (read every weight + KV per token). This is why node A4's Wide-EP
+  matters: it minimizes bytes moved per decode step. One-line roofline intuition in glossary; enough for this course.</p></div></details>
+
+<details class="node"><summary><span class="nid">B2</span> Interconnect: scale-up domains, RDMA, GDR</summary>
+  <div class="body"><p>8–128 GPUs within an <b>NVLink/scale-up domain</b> can move data fast enough for collective-heavy
+  math; across machines use RDMA. DeepInfer specifics worth noticing: KV <b>swap-in uses GDR</b> (RDMA NIC copies to
+  HBM without touching SMs) because CUDA copy engines handle fine-grained KV blocks poorly; cross-machine SWA hits
+  pull over a 400G VLAN; splitting P/D across datacenters is feasible with ~400 Gbps per 8 GPUs <span class="cite">(Q&A §cluster/storage, §kv hits)</span>.</p></div></details>
+
+<details class="node"><summary><span class="nid">B3</span> Execution models: CUDA graphs & async scheduling</summary>
+  <div class="body"><p><b>CUDA graphs</b> = pre-recorded GPU work sequences that remove launch overhead
+  (<code>worker/cuda_graph_runner.py</code>). <b>Async scheduling</b> (the "zero-overhead batch scheduler") overlaps
+  CPU scheduling of step N+1 with GPU running step N — following SGLang/NanoFlow <span class="cite">(Q&A §async)</span>.
+  Here's the repo fact that surprised us: <b>the scheduler itself is native code</b> — <code>deepinfer/_C/engine.pyi</code>
+  stubs it out from <code>csrc/engine/</code>; Python only creates it (<code>llm_engine.py::<code>_create_scheduler</code></code>).
+  The hot loop of a serving engine at this scale is no longer a Python dict walk.</p></div></details>
+
+<details class="node"><summary><span class="nid">B4</span> Collectives: all-reduce & all-to-all</summary>
+  <div class="body"><p>Parallel models talk via <b>collectives</b>. MoE's EP gate is <b>all-to-all</b> (each token
+  dispatched to its experts' GPUs and back) — that's <a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>'s whole
+  job. DP load balancing does an all-reduce MIN on quotas each prefill step <span class="cite">(Q&A §prefill LB)</span>.
+  EPLB shuffles expert weights over NVLink <code>symm_mem</code>. If you've never written a collective, no planned lesson
+  requires it — but you must read them fluently.</p></div></details>
+
+<details class="node"><summary><span class="nid">B5</span><span class="star">Storage engineering: the 3FS KV store</span></summary>
+  <div class="body"><p>The persistent layer: a dedicated <a href="https://github.com/deepseek-ai/3FS">3FS</a> cluster, ~100 PiB
+  of SSD, 10+2 erasure coding, ~40 GB/s read per storage server, LRU GC worker per node; KV blocks stored by
+  <code>kvcache-store</code>; TTL ≈ 3 days (agents) / 7 days (chatbots; long-tail hits make loss expensive — ~0.5–1% hit-rate
+  cost). Design reason to memorize: a dedicated store lets <b>any engine hit any prefix</b>, decoupling prefix
+  affinity from load balancing <span class="cite">(Q&A §KV cache storage)</span>.</p></div></details>
+
+<h2>4 · Tier C — The DeepSeek deltas <span class="meta">— where this repo is genuinely novel</span></h2>
+<p class="prereq">built on: A2 A4 A6 B3 B5</p>
+
+<details class="node"><summary><span class="nid">C1</span> MLA & FlashMLA — why DeepSeek KV is small</summary>
+  <div class="body"><p><a href="https://arxiv.org/abs/2412.19437">MLA</a> stores attention as a compressed latent
+  instead of per-head K/V — the root of DeepSeek's KV economics, and the reason kernel work concentrates in
+  <a href="https://github.com/deepseek-ai/FlashMLA">FlashMLA</a> (one HW branch: "flash" variants handle the windowed
+  SWA case here — see C3). Background lesson 0004.</p></div></details>
+
+<details class="node"><summary><span class="nid">C2</span><span class="star">V4.1-Flash architecture: CED/YOCO + SWA + C2</span></summary>
+  <div class="body"><p>The served model departs from a textbook transformer: <b>CED/YOCO-style split</b> — the
+  <em>decoder's</em> block KV cache is <b>projected from the last encoder layer's hidden state</b>, so decoder KV is
+  cheap to produce; ~20 stored layers use <b>sliding window attention (SWA)</b>; "C2 compression" maintains accumulating
+  states (<code>ca_state</code>/<code>ica_state</code> at 128-token boundaries) — DeepSeek's linear-attention-family
+  ingredient; the model also feeds an <b>Engram</b> hash n-gram layer (<code>v4_modules/engram_*.py</code>) built on a
+  cross-layer KV-sharing topology (<code>v4_modules/cross_layer.py</code>, share-kv/index/index-k). Vocabulary to be
+  unpacked in Lesson 0004 using <code>model_executor/models/deepseek.py</code> + <code>v4_modules/</code> as lab
+  specimens. Correction from a repo audit: <b>DSML marker handling lives in the external
+  <a href="https://github.com/deepseek-ai/deepseek-recipe">deepseek-recipe</a> repo, not DeepInfer</b>
+  <span class="cite">(Q&A §SWA KV, §bounded replay)</span>.</p></div></details>
+
+<details class="node"><summary><span class="nid">C3</span><span class="star">SWA bounded replay — the cleverest trick</span></summary>
+  <div class="body"><p>The sliding-window state can't be kept for 72 hours economically. Trick: on a cache hit with
+  a missing SWA window, <b>recompute only the last 128 tokens</b>, back off one 128-block if the window misses
+  (hit length rule: L₁ possibly −128, capped at L−134), cutting cost <em>to a constant</em> independent of context and
+  layers. Decoder-side it nearly halves prefill compute <span class="cite">(Q&A §bounded replay)</span>. Env knobs:
+  <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact</code>, <code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS=140</code>.
+  Lesson 0005 walks it with the <code>examples/yoco/</code> code.</p></div></details>
+
+<details class="node"><summary><span class="nid">C4</span><span class="star">DSpark: verify the drafts worth verifying</span></summary>
+  <div class="body"><p>Fixed-length draft verification wastes compute on low-acceptance tokens. DSpark adds a
+  <b>confidence head</b> predicting per-draft-token acceptance; scheduling picks the subset maximizing marginal
+  return (measured: verified length 5.0 → 3.2–4.4 at unchanged accepted length 3.29; +4–7% at production operating point).
+  Systems twist: when async step N+1 is scheduled, step N's confidences don't exist yet — so length is computed
+  <b>on-GPU by a TileLang kernel</b> (cumprod + topk sort, fused remap) writing to a pinned buffer
+  <span class="cite">(Q&A §spec decoding)</span>. Lesson 0005b.</p></div></details>
+
+<details class="node"><summary><span class="nid">C5</span> Determinism is a feature you pay for</summary>
+  <div class="body"><p>Batched GPU inference isn't bit-reproducible (reduction order changes with batch composition).
+  DeepInfer offers <b>batch-invariant mode</b> (identical results regardless of batch: <code>DEEPINFER_BATCH_INVARIANT=1</code>)
+  and <b>deterministic sampling</b> (fixed <code>seq_seed</code>, MTP off) — NV-only. Nuance from the repo walk:
+batch-invariance is <b>on by default</b> in the offline examples on NVIDIA (<code>examples/offline_inference.py:43</code>)
+while the eval runner labels it "(slower)" — reproducibility is a default, not an opt-in. Why you'd ever turn it off:
+throughput. Why you'd want it: debugging, evals, reproducible research.</p></div></details>
+
+<details class="node"><summary><span class="nid">C6</span> EPD disaggregation & storage as a first-class engine</summary>
+  <div class="body"><p>1P+1D deployable; realistic units 64+64 GPUs. With the KV cache decoupled to B5's 3FS store,
+  prefill machines don't need affinity — "engines pull work by remaining compute quota" and prefill cost is solved
+  per step by a fitted <b>quadratic cost model</b> under a nanosecond budget <span class="cite">(Q&A §prefill LB)</span>.
+  You'll meet that scheduler in Lesson 0002.</p></div></details>
+
+<h2>5 · Tier D — The codebase map <span class="meta">— the DAG's leaves</span></h2>
+<p class="prereq">built on: everything above</p>
+
+<details class="node" open><summary><span class="nid">D1</span><span class="star">Boot path & the native scheduler</span></summary>
+  <div class="body"><p><code>entrypoints/llm.py</code> (LLM) → <code>engine/llm_engine.py</code> (LLMEngine;
+  <code>_init_workers</code>, <code>_init_cache</code>, <code>_create_scheduler</code>) → <code>worker/model_runner.py</code>
+  (ModelRunner) → <code>model_executor/models/deepseek.py</code>. Scheduler: <b>native</b>, stubbed in <code>deepinfer/_C/engine.pyi</code>.
+  Your assignment today is to trace exactly this spine in <code>assignments/0001-trace-boot-path.py</code>.
+  The full map lives in <a href="../reference/0001-repo-map.html">Reference 0001</a>.</p></div></details>
+
+<details class="node"><summary><span class="nid">D2</span> Model execution layer</summary>
+  <div class="body"><p><code>models/deepseek.py</code> (<code>DeepseekForCausalLM</code>) + <code>v4_modules/</code> (the
+  novel V4.1 pieces) + <code>mtp/</code> (draft/MTP) + <code>layers/</code>: <code>attention_backend.py</code>,
+  <code>sampler.py</code>, <code>layernorm</code>, <code>rotary_embedding</code>, <code>tilelang_ops/</code> (incl.
+  <code>*_zos.py</code> async-scheduling kernels and Ascend twins), <code>mtp_info_pool.py</code>,
+  <code>eplb/</code>, <code>input_metadata/</code>.</p></div></details>
+
+<details class="node"><summary><span class="nid">D3</span> Kernels: vendor + csrc + TileLang</summary>
+  <div class="body"><p><code>vendor/</code> submodules = FlashMLA (attention), DeepGEMM (GEMM; FP8/FP4),
+  DeepEP (MoE comm), DeepSelect — each with an Ascend mirror — plus hand-written TileLang in
+  <code>tilelang_ops/</code> and C++ glue in <code>csrc/</code>. Per the Q&A, internal versions differ from public
+  ones by ~5% end-to-end.</p></div></details>
+
+<details class="node"><summary><span class="nid">D4</span> Async/verify plumbing ("zos")</summary>
+  <div class="body"><p><code>worker/zos_status.py</code>, <code>sequence.py</code> GPU-resident buffers for sampled
+  tokens / MTP predictions / confidence rates ("D2D in zos"), <code>dflash_cuda_graph_runner.py</code> (DFlash =
+  the draft-model graph runner). Read together in Lesson 0005b once spec decoding is solid.</p></div></details>
+
+<details class="node"><summary><span class="nid">D5</span> Peripherals with lessons of their own</summary>
+  <div class="body"><p><code>ve/</code> vision processing (EPD's third leg), <code>structure_output/</code>
+  (grammar compiler → per-step masks), <code>distributed/</code>, <code>deep_cluster/</code> (hardware/topology
+  binding), <code>hugging_face/</code> (loading). Secondary lessons; each short.</p></div></details>
+
+<details class="node"><summary><span class="nid">D6</span> Measurement: benchmarks & evals</summary>
+  <div class="body"><p><code>examples/benchmark.py</code> (carefully decoupled prefill/decode metrics; profiler
+  sections; full-acceptance accounting — read <code>examples/README.md</code> before trusting any number),
+  <code>examples/sweep/</code>, <code>eval/</code> (AIME, GPQA, HLE), PPL baselines as golden tests
+  (<code>tests/models/offline_decode_ppl.json</code>). Lesson 0006.</p></div></details>
+
+<h2>6 · Reading order of the DAG (the course plan)</h2>
+<p>Later lessons follow the arrows: <b>0002</b> = A1+D1 (two-phase inference, then watch the boot path at runtime state level),
+<b>0003</b> = A2+A4+B3 (KV/parallelism/scheduling — the "engine" half),
+<b>0004</b> = C1+C2 (the model), <b>0005</b> = C3+C4+D4 (the novel serving tricks),
+<b>0006</b> = D6+D3 (measurement & kernels — how to read claims honestly), then peripherals (D5) and a synthesis.
+Each lesson: define → read code → one runnable assignment. Missions stay anchored in <code>MISSION.md</code>.</p>
+
+<div class="callout">
+  <b>Primary source for this session</b>: <code>doc/inference_deployment_qa.md</code> in the repo — Dense, official,
+  self-critical. Skim <b>§inference system overview</b> and <b>§asynchronous scheduling</b> now; we'll mine it
+  section-by-section through the course.
+</div>
+
+<h2>7 · Self-check <span class="meta">— retrieval, not recognition</span></h2>
+<p>Answer from memory first. Guessing is allowed; guessing wrong then reading the explanation is the practice
+that sticks.</p>
+<div id="quiz" class="quiz"></div>
+<p class="footnote">Reload this lesson later (e.g. in 2 days) and retake — that's spacing, the highest-value
+retention tool we have.</p>
+
+<h2>8 · Repo walk <span class="meta">— 6 commands, 15 minutes</span></h2>
+<p>Run in <a href="../DeepInfer">../DeepInfer</a> (mac Terminal is fine — static reading only). Check each box mentally:
+</p>
+<ul class="task">
+  <li><code>find deepinfer -maxdepth 2 -type d</code> — see Tier D's skeleton with your own eyes.</li>
+  <li><code>ls vendor/</code> — the kernel submodules (S4, D3).</li>
+  <li><code>grep -n "251\|class DeepseekForCausalLM" deepinfer/model_executor/models/deepseek.py | head -3</code></li>
+  <li><code>sed -n '304,312p' deepinfer/engine/llm_engine.py</code> — the scheduler being created (D1).
+      Notice what class it instantiates and where that class really lives.</li>
+  <li><code>sed -n '309,315p' deepinfer/_C/engine.pyi</code> — the native <code>Scheduler</code> stub (B3).</li>
+  <li><code>sed -n '55,75p' deepinfer/worker/model_runner.py</code> — ModelRunner's docstring: what a worker owns.</li>
+</ul>
+
+<h2>9 · Assignment 0001 — trace the boot path</h2>
+<p>Fill the six <code>ANSWER_*</code> constants in
+<a href="../assignments/0001-trace-boot-path.py"><code>assignments/0001-trace-boot-path.py</code></a>, then run it:</p>
+<pre>python3 assignments/0001-trace-boot-path.py</pre>
+<p>Instant pass/fail with hints if you miss. The point is the <em>search</em>, remember it in Week 6; the trivia isn't.</p>
+
+<h2>Next & ask</h2>
+<p><b>Next lesson (0002): prefill vs decode in motion</b> — we'll define A1 rigorously (roofline, TTFT/TBT), then read
+how the engine treats requests differently per phase. Before then: skim <code>doc/inference_deployment_qa.md</code> §overview.</p>
+<div class="callout mission"><b>Mission note</b>: anything unclear — ask me in the chat. As your teacher I can expand any
+card on this page, or pull a different resource from <code>RESOURCES.md</code>. No question is off-mission.</div>
+</body>
+<script src="../assets/quiz.js"></script>
+<script>
+window.QUIZ.render(document.getElementById("quiz"), [
+  { q: "Decode (token-by-token generation) is almost always bottlenecked by:",
+    options: ["memory bandwidth", "tensor throughput", "network fabric"], correct: 0,
+    explain: "Each decode step re-reads weights + KV from HBM to produce one token — the SMs mostly wait on bytes (B1). That's why bits-per-value (A7) and bytes-per-step (Wide-EP, A4) dominate decode economics." },
+  { q: "Wide-EP (EP64–128 in decode) is worthwhile mostly because it:",
+    options: ["reduces per-step memory traffic", "widens the attention window", "exposes more active experts"], correct: 0,
+    explain: "Q&A: Wide-EP 'substantially reduces per-step memory traffic in the MoE expert part'. Attention window is a model-arch property (C2/C3), and EP total experts doesn't change which experts activate." },
+  { q: "The persistent (72h+) KV cache lives on:",
+    options: ["the 3FS storage cluster", "the entrypoint machines", "decode GPU memory"], correct: 0,
+    explain: "Paged block KV sits on a dedicated 3FS cluster (~100 PiB, 10+2 EC) so any engine can hit any prefix (B5). In-flight KV is on GPUs; SWA KV lives on the producing host (Q&A §storage)." },
+  { q: "SWA bounded replay recomputes, at most:",
+    options: ["the last 128 tokens", "the visible context window", "one scheduler step's KV"], correct: 0,
+    explain: "Replay cost is constant: the last 128 tokens (back off one 128-block if the SWA window is missing; hit length capped at L−134) — independent of context length and layer count (C3)." },
+  { q: "DSpark decides draft verification length via:",
+    options: ["per-token confidence predictions", "a fixed global draft span", "the sampler's temperature"], correct: 0,
+    explain: "A Confidence Head predicts per-draft-token acceptance; the scheduler keeps the subset with highest marginal return (5.0 → 3.2–4.4 verified, ~same accepted length, +4–7%) (C4)." }
+]);
+</script>
+</html>
